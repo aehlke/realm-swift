@@ -29,6 +29,37 @@ import Foundation
 
 @available(*, deprecated) // Silence deprecation warnings for RealmOptional
 class ObjectSchemaInitializationTests: TestCase {
+    func testUninitializedLeafSchemaAfterInitializingAncestor() {
+        let ancestor = SwiftSchemaInheritanceRoot()
+        XCTAssertEqual(ancestor.objectSchema.properties.map(\.name), ["rootValue"])
+
+        // Do not initialize the middle class before the leaf. The leaf must
+        // inherit the root's cached sharedSchema method through two levels.
+        let leaf = SwiftSchemaInheritanceLeaf()
+        guard leaf.isKind(of: SwiftSchemaInheritanceLeaf.self) else {
+            XCTFail("Initializing a leaf must preserve its runtime class")
+            return
+        }
+        XCTAssertEqual(Set(leaf.objectSchema.properties.map(\.name)),
+                       Set(["rootValue", "middleValue", "leafValue"]))
+
+        leaf.rootValue = 11
+        leaf.middleValue = "middle"
+        leaf.leafValue = 23
+        XCTAssertEqual(leaf.rootValue, 11)
+        XCTAssertEqual(leaf.middleValue, "middle")
+        XCTAssertEqual(leaf.leafValue, 23)
+
+        let secondLeaf = SwiftSchemaInheritanceLeaf()
+        guard secondLeaf.isKind(of: SwiftSchemaInheritanceLeaf.self) else {
+            XCTFail("The cached leaf schema must preserve its runtime class")
+            return
+        }
+        secondLeaf.leafValue = 47
+        XCTAssertEqual(secondLeaf.leafValue, 47)
+        XCTAssertEqual(leaf.leafValue, 23)
+    }
+
     func testAllValidTypes() {
         let object = SwiftObject()
         let objectSchema = object.objectSchema
@@ -749,6 +780,21 @@ class ObjectSchemaInitializationTests: TestCase {
         XCTAssertTrue(RLMProperty(name: "_property", value: Persisted<IntWrapper>(wrappedValue: v, primaryKey: true)).isPrimary)
     }
     #endif // DEBUG
+}
+
+// Explicit initialization controls schema order for the inheritance regression.
+// These classes must not be initialized by global schema discovery.
+class SwiftSchemaInheritanceRoot: Object {
+    override class func _realmIgnoreClass() -> Bool { return true }
+    @Persisted var rootValue: Int
+}
+
+class SwiftSchemaInheritanceMiddle: SwiftSchemaInheritanceRoot {
+    @Persisted var middleValue: String
+}
+
+class SwiftSchemaInheritanceLeaf: SwiftSchemaInheritanceMiddle {
+    @Persisted var leafValue: Int
 }
 
 class SwiftFakeObject: Object {
