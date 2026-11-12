@@ -327,7 +327,7 @@ public extension Realm {
     static func withExclusiveFileAccess<T>(
         configurations: [Configuration], _ body: ([FileInspection]) throws -> T
     ) throws -> T {
-        var outcome: Result<T, Error>?
+        var outcome: Result<T, Swift.Error>?
         do {
             try RLMRealmSessionAdmission.performExclusiveFileAccess(
                 configurations: configurations.map(\.rlmConfiguration), body: { values, errorPointer in
