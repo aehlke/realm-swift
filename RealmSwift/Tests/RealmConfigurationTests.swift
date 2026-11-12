@@ -180,10 +180,10 @@ class RealmSessionAdmissionTests: TestCase {
             migrated.schemaVersion = 1
             migrated.objectTypes = [AdmissionWritable.self] // A successful migration would remove legacy tables.
             migrated.sessionAdmission = try contract()
-            var migrationRan = false
-            migrated.migrationBlock = { _, _ in migrationRan = true }
+            let migrationRan = Locked(false)
+            migrated.migrationBlock = { _, _ in migrationRan.value = true }
             assertAdmissionError(6) { try Realm(configuration: migrated) }
-            XCTAssertFalse(migrationRan)
+            XCTAssertFalse(migrationRan.value)
             XCTAssertEqual(try Data(contentsOf: url), before)
             let attributesAfter = try FileManager.default.attributesOfItem(atPath: url.path)
             XCTAssertEqual(attributesAfter[.systemFileNumber] as? NSNumber, inodeBefore)
@@ -358,10 +358,10 @@ extension RealmSessionAdmissionTests {
             assertAdmissionError(3) { try Realm(configuration: seededAlias) }
             var migratedAlias = ordinaryAlias
             migratedAlias.schemaVersion = 1
-            var migrated = false
-            migratedAlias.migrationBlock = { _, _ in migrated = true }
+            let migrated = Locked(false)
+            migratedAlias.migrationBlock = { _, _ in migrated.value = true }
             assertAdmissionError(3) { try Realm(configuration: migratedAlias) }
-            XCTAssertFalse(migrated)
+            XCTAssertFalse(migrated.value)
             assertAdmissionError(3) { try Realm.deleteFiles(for: ordinaryAlias) }
             assertAdmissionError(3) { try Realm.deleteFiles(for: guardedAlias) }
             assertAdmissionError(3) { try owner.writeCopy(toFile: aliasURL) }
