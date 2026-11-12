@@ -145,7 +145,7 @@ NSError *RLMRealmSessionAdmissionErrorFromException(const realm::SessionAdmissio
 }
 - (NSUInteger)hash { return self.fingerprint.hash; }
 + (BOOL)performExclusiveFileAccessWithConfigurations:(NSArray<RLMRealmConfiguration *> *)configurations
-    body:(BOOL (^)(NSArray<RLMRealmFileInspection *> *, NSError **))body error:(NSError **)error {
+    body:(NS_NOESCAPE BOOL (^)(NSArray<RLMRealmFileInspection *> *, NSError **))body error:(NSError **)error {
     try {
         using R = realm::SessionAdmissionError::Reason;
         if (!configurations.count || configurations.count > 64) throw realm::SessionAdmissionError(R::invalid_descriptor);
@@ -171,7 +171,7 @@ NSError *RLMRealmSessionAdmissionErrorFromException(const realm::SessionAdmissio
             if (![NSFileManager.defaultManager createDirectoryAtURL:parent withIntermediateDirectories:YES
                 attributes:nil error:&directoryError]) { RLMSetErrorOrThrow(directoryError, error); return NO; }
         }
-        __block NSError *bodyError = nil;
+        NSError *bodyError = nil;
         bool succeeded = false;
         std::function<void(size_t)> acquire = [&](size_t index) {
             if (index < values.size()) {
@@ -200,7 +200,11 @@ NSError *RLMRealmSessionAdmissionErrorFromException(const realm::SessionAdmissio
             // their locks while leaving an alias for a destructive callback.
             for (const auto& config : values)
                 realm::SessionAdmission::validate_payload_path(config.path);
-            succeeded = body(facts, &bodyError);
+            // ARC writeback uses a callback-local variable; the outer strong
+            // reference retains the error after the synchronous lock body exits.
+            NSError *callbackError = nil;
+            succeeded = body(facts, &callbackError);
+            bodyError = callbackError;
         };
         acquire(0);
         if (!succeeded) {
