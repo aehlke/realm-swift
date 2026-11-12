@@ -19,6 +19,9 @@
 #import "RLMRealmConfiguration_Private.h"
 
 #import <realm/object-store/shared_realm.hpp>
+#import <realm/session_admission.hpp>
+
+NSError *RLMRealmSessionAdmissionErrorFromException(const realm::SessionAdmissionError&);
 
 @interface RLMRealmConfiguration ()
 - (realm::Realm::Config)config;

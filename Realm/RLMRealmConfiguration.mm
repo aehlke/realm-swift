@@ -16,7 +16,14 @@
 //
 ////////////////////////////////////////////////////////////////////////////
 
-#import "RLMRealmConfiguration_Private.h"
+#import "RLMRealmConfiguration_Private.hpp"
+#import "RLMSchema_Private.h"
+#import <realm/db.hpp>
+#import <realm/group.hpp>
+#import <realm/object-store/object_store.hpp>
+#import <realm/session_admission.hpp>
+#import <algorithm>
+#import <functional>
 
 #import "RLMObjectSchema_Private.hpp"
 #import "RLMRealm_Private.h"
@@ -28,6 +35,7 @@
 
 static NSString *const c_RLMRealmConfigurationProperties[] = {
     @"fileURL",
+    @"sessionAdmission",
     @"inMemoryIdentifier",
     @"encryptionKey",
     @"readOnly",
@@ -52,8 +60,172 @@ NSString *RLMRealmPathForFile(NSString *fileName) {
     return [directory stringByAppendingPathComponent:fileName];
 }
 
+NSErrorDomain const RLMRealmSessionAdmissionErrorDomain = @"io.realm.session-admission";
+
+NSError *RLMRealmSessionAdmissionErrorFromException(const realm::SessionAdmissionError& error) {
+    return [NSError errorWithDomain:RLMRealmSessionAdmissionErrorDomain code:NSInteger(error.reason)
+        userInfo:@{NSLocalizedDescriptionKey: @(error.what())}];
+}
+
+@interface RLMRealmFileInspection ()
+- (instancetype)initWithURL:(NSURL *)url exists:(BOOL)exists version:(NSNumber *)version;
+@end
+@implementation RLMRealmFileInspection
+- (instancetype)initWithURL:(NSURL *)url exists:(BOOL)exists version:(NSNumber *)version {
+    if ((self = [super init])) { _fileURL = [url copy]; _fileExists = exists; _schemaVersion = version; }
+    return self;
+}
+@end
+
+@interface RLMRealmSessionAdmission ()
+- (instancetype)initWithCore:(std::shared_ptr<const realm::SessionAdmission>)value;
+- (std::shared_ptr<const realm::SessionAdmission>)coreAdmission;
+@end
+@implementation RLMRealmSessionAdmission {
+    std::shared_ptr<const realm::SessionAdmission> _value;
+}
+- (instancetype)initWithCore:(std::shared_ptr<const realm::SessionAdmission>)value {
+    if ((self = [super init])) _value = std::move(value);
+    return self;
+}
+- (std::shared_ptr<const realm::SessionAdmission>)coreAdmission { return _value; }
+- (instancetype)initWithIdentifier:(NSString *)identifier objectClasses:(NSArray<Class> *)classes error:(NSError **)error {
+    try {
+        auto schema = [RLMSchema schemaWithObjectClasses:classes].objectStoreCopy;
+        std::vector<realm::SessionAdmission::Table> tables;
+        for (const auto& object : schema) {
+            realm::SessionAdmission::Table table;
+            table.name = realm::ObjectStore::table_name_for_object_type(object.name);
+            table.kind = unsigned(object.table_type); table.primary_key = object.primary_key;
+            for (const auto& property : object.persisted_properties) {
+                realm::SessionAdmission::Column column; column.name = property.name;
+                using T = realm::PropertyType;
+                switch (property.type & ~T::Flags) {
+                    case T::Int: column.type = realm::type_Int; break;
+                    case T::Bool: column.type = realm::type_Bool; break;
+                    case T::String: column.type = realm::type_String; break;
+                    case T::Data: column.type = realm::type_Binary; break;
+                    case T::Date: column.type = realm::type_Timestamp; break;
+                    case T::Float: column.type = realm::type_Float; break;
+                    case T::Double: column.type = realm::type_Double; break;
+                    case T::Object: column.type = realm::type_Link;
+                        column.link_target = realm::ObjectStore::table_name_for_object_type(property.object_type); break;
+                    case T::Mixed: column.type = realm::type_Mixed; break;
+                    case T::ObjectId: column.type = realm::type_ObjectId; break;
+                    case T::Decimal: column.type = realm::type_Decimal; break;
+                    case T::UUID: column.type = realm::type_UUID; break;
+                    default: throw realm::SessionAdmissionError(realm::SessionAdmissionError::Reason::invalid_descriptor);
+                }
+                column.nullable = realm::is_nullable(property.type);
+                column.collection = realm::is_array(property.type) ? 1 : realm::is_set(property.type) ? 2
+                    : realm::is_dictionary(property.type) ? 4 : 0;
+                column.indexed = property.requires_index();
+                column.fulltext_indexed = property.requires_fulltext_index();
+                table.columns.push_back(std::move(column));
+            }
+            tables.push_back(std::move(table));
+        }
+        std::string admissionIdentifier;
+        RLMNSStringToStdString(admissionIdentifier, identifier);
+        return [self initWithCore:std::make_shared<const realm::SessionAdmission>(std::move(admissionIdentifier), std::move(tables))];
+    } catch (const realm::SessionAdmissionError& ex) {
+        RLMSetErrorOrThrow(RLMRealmSessionAdmissionErrorFromException(ex), error); return nil;
+    } catch (const std::exception& ex) {
+        RLMSetErrorOrThrow([NSError errorWithDomain:RLMRealmSessionAdmissionErrorDomain
+            code:RLMRealmSessionAdmissionErrorInvalidDescriptor userInfo:@{NSLocalizedDescriptionKey: @(ex.what())}], error);
+        return nil;
+    }
+}
+- (NSString *)identifier { return @(_value->identifier().c_str()); }
+- (NSData *)fingerprint { return [NSData dataWithBytes:_value->identity().data() length:_value->identity().size()]; }
+- (id)copyWithZone:(NSZone *)zone { (void)zone; return self; }
+- (BOOL)isEqual:(id)object {
+    return [object isKindOfClass:RLMRealmSessionAdmission.class]
+        && [self.fingerprint isEqual:((RLMRealmSessionAdmission *)object).fingerprint];
+}
+- (NSUInteger)hash { return self.fingerprint.hash; }
++ (BOOL)performExclusiveFileAccessWithConfigurations:(NSArray<RLMRealmConfiguration *> *)configurations
+    body:(BOOL (^)(NSArray<RLMRealmFileInspection *> *, NSError **))body error:(NSError **)error {
+    try {
+        using R = realm::SessionAdmissionError::Reason;
+        if (!configurations.count || configurations.count > 64) throw realm::SessionAdmissionError(R::invalid_descriptor);
+        std::vector<realm::Realm::Config> values;
+        for (RLMRealmConfiguration *configuration in configurations) {
+            auto config = configuration.config;
+            if (!config.session_admission || config.in_memory || config.path.empty() || configuration.seedFilePath)
+                throw realm::SessionAdmissionError(R::unsupported_configuration);
+            realm::SessionAdmission::validate_payload_path(config.path);
+            values.push_back(std::move(config));
+        }
+        std::sort(values.begin(), values.end(), [](const auto& a, const auto& b) { return a.path < b.path; });
+        for (size_t i = 1; i < values.size(); ++i) {
+            if (values[i-1].path == values[i].path && (values[i-1].encryption_key != values[i].encryption_key
+                || realm::SessionAdmission::identity_of(values[i-1].session_admission)
+                    != realm::SessionAdmission::identity_of(values[i].session_admission)))
+                throw realm::SessionAdmissionError(R::invalid_descriptor);
+        }
+        values.erase(std::unique(values.begin(), values.end(), [](const auto& a, const auto& b) { return a.path == b.path; }), values.end());
+        for (const auto& config : values) {
+            NSURL *parent = [[NSURL fileURLWithPath:@(config.path.c_str())] URLByDeletingLastPathComponent];
+            NSError *directoryError = nil;
+            if (![NSFileManager.defaultManager createDirectoryAtURL:parent withIntermediateDirectories:YES
+                attributes:nil error:&directoryError]) { RLMSetErrorOrThrow(directoryError, error); return NO; }
+        }
+        __block NSError *bodyError = nil;
+        bool succeeded = false;
+        std::function<void(size_t)> acquire = [&](size_t index) {
+            if (index < values.size()) {
+                if (!realm::DB::call_with_lock(values[index].path, [&](const std::string&) { acquire(index + 1); }))
+                    throw realm::SessionAdmissionError(R::busy);
+                return;
+            }
+            NSMutableArray<RLMRealmFileInspection *> *facts = [NSMutableArray new];
+            for (const auto& config : values) {
+                realm::SessionAdmission::validate_payload_path(config.path);
+                bool exists = realm::util::File::exists(config.path);
+                NSNumber *version = nil;
+                if (exists) {
+                    try {
+                        realm::Group physical(config.path, config.encryption_key.empty() ? nullptr : config.encryption_key.data());
+                        config.session_admission->inspect(physical);
+                        auto schemaVersion = realm::ObjectStore::get_schema_version(physical);
+                        if (schemaVersion != realm::ObjectStore::NotVersioned) version = @(schemaVersion);
+                    } catch (const realm::SessionAdmissionError&) { throw; }
+                    catch (...) { throw realm::SessionAdmissionError(R::unreadable); }
+                }
+                [facts addObject:[[RLMRealmFileInspection alloc] initWithURL:[NSURL fileURLWithPath:@(config.path.c_str())]
+                    exists:exists version:version]];
+            }
+            // Preserve the supplied operation paths; never canonicalize only
+            // their locks while leaving an alias for a destructive callback.
+            for (const auto& config : values)
+                realm::SessionAdmission::validate_payload_path(config.path);
+            succeeded = body(facts, &bodyError);
+        };
+        acquire(0);
+        if (!succeeded) {
+            RLMSetErrorOrThrow(bodyError ?: [NSError errorWithDomain:RLMRealmSessionAdmissionErrorDomain
+                code:RLMRealmSessionAdmissionErrorUnreadable userInfo:nil], error); return NO;
+        }
+        return YES;
+    } catch (const realm::SessionAdmissionError& ex) {
+        RLMSetErrorOrThrow(RLMRealmSessionAdmissionErrorFromException(ex), error); return NO;
+    } catch (const std::exception& ex) {
+        RLMSetErrorOrThrow([NSError errorWithDomain:RLMRealmSessionAdmissionErrorDomain
+            code:RLMRealmSessionAdmissionErrorUnreadable userInfo:@{NSLocalizedDescriptionKey: @(ex.what())}], error); return NO;
+    }
+}
+@end
+
 @implementation RLMRealmConfiguration {
     realm::Realm::Config _config;
+}
+
+- (RLMRealmSessionAdmission *)sessionAdmission {
+    return _config.session_admission ? [[RLMRealmSessionAdmission alloc] initWithCore:_config.session_admission] : nil;
+}
+- (void)setSessionAdmission:(RLMRealmSessionAdmission *)admission {
+    _config.session_admission = admission ? [admission coreAdmission] : nullptr;
 }
 
 - (realm::Realm::Config&)configRef {

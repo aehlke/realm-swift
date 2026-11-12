@@ -138,6 +138,16 @@ extension Realm {
         /// The current schema version.
         public var schemaVersion: UInt64 = 0
 
+        /// Sealed writer-cohort capability. Read-only inspection uses
+        /// withExclusiveFileAccess; it is never a transferable open token.
+        /// Mutable opens, including a nil contract, require an absent payload or
+        /// a regular file with one directory entry and stable adjacent lock identity.
+        /// Terminal payload aliases are unsupported. Parent aliases must share
+        /// both the actual payload and coordination file. Historical alias writers
+        /// or lifecycle code that removes coordination files remain outside this
+        /// advisory contract.
+        public var sessionAdmission: Realm.SessionAdmission?
+
         /// The block which migrates the Realm to the current version.
         @preconcurrency
         public var migrationBlock: MigrationBlock?
@@ -232,6 +242,7 @@ extension Realm {
             configuration.encryptionKey = self.encryptionKey
             configuration.readOnly = self.readOnly
             configuration.schemaVersion = self.schemaVersion
+            configuration.sessionAdmission = self.sessionAdmission?.rlmValue
             configuration.migrationBlock = self.migrationBlock
             configuration.migrationObjectClass = MigrationObject.self
             configuration.deleteRealmIfMigrationNeeded = self.deleteRealmIfMigrationNeeded
@@ -249,6 +260,7 @@ extension Realm {
             configuration.encryptionKey = rlmConfiguration.encryptionKey
             configuration.readOnly = rlmConfiguration.readOnly
             configuration.schemaVersion = rlmConfiguration.schemaVersion
+            configuration.sessionAdmission = rlmConfiguration.sessionAdmission.map(Realm.SessionAdmission.init)
             configuration.migrationBlock = rlmConfiguration.migrationBlock
             configuration.deleteRealmIfMigrationNeeded = rlmConfiguration.deleteRealmIfMigrationNeeded
             configuration.shouldCompactOnLaunch = rlmConfiguration.shouldCompactOnLaunch.map(ObjectiveCSupport.convert)
@@ -280,6 +292,63 @@ extension Realm.Configuration: Equatable {
             lhs.fileURL == rhs.fileURL &&
             lhs.inMemoryIdentifier == rhs.inMemoryIdentifier &&
             lhs.readOnly == rhs.readOnly &&
-            lhs.schemaVersion == rhs.schemaVersion
+            lhs.schemaVersion == rhs.schemaVersion &&
+            lhs.sessionAdmission == rhs.sessionAdmission
+    }
+}
+
+
+public extension Realm {
+    /// Immutable metadata, constructed without opening or changing a Realm.
+    final class SessionAdmission: @unchecked Sendable, Equatable {
+        fileprivate let rlmValue: RLMRealmSessionAdmission
+        public var identifier: String { rlmValue.identifier }
+        public var fingerprint: Data { rlmValue.fingerprint }
+        public init(identifier: String, emptyObjectTypes: [ObjectBase.Type]) throws {
+            rlmValue = try RLMRealmSessionAdmission(identifier: identifier, objectClasses: emptyObjectTypes)
+        }
+        fileprivate init(_ value: RLMRealmSessionAdmission) { rlmValue = value }
+        public static func == (lhs: SessionAdmission, rhs: SessionAdmission) -> Bool {
+            lhs.fingerprint == rhs.fingerprint
+        }
+    }
+
+    struct FileInspection: Sendable {
+        public let fileURL: URL
+        public let fileExists: Bool
+        public let schemaVersion: UInt64?
+    }
+
+    /// Inspect protected tables and retain exclusive lifecycle access through
+    /// a synchronous file operation. Never open Realm at these paths inside the
+    /// body or remove/move their lock/management coordination state. No fact
+    /// returned here grants authority to a future mutable open: that open must
+    /// carry its own sessionAdmission and is inspected afresh by its actual DB.
+    static func withExclusiveFileAccess<T>(
+        configurations: [Configuration], _ body: ([FileInspection]) throws -> T
+    ) throws -> T {
+        var outcome: Result<T, Error>?
+        do {
+            try RLMRealmSessionAdmission.performExclusiveFileAccess(
+                configurations: configurations.map(\.rlmConfiguration), body: { values, errorPointer in
+                    let facts = values.map { FileInspection(fileURL: $0.fileURL,
+                        fileExists: $0.fileExists, schemaVersion: $0.schemaVersion?.uint64Value) }
+                    let result = Result { try body(facts) }
+                    outcome = result
+                    if case .failure(let error) = result {
+                        errorPointer?.pointee = error as NSError
+                        return false
+                    }
+                    return true
+                })
+        } catch {
+            if case .failure(let bodyError) = outcome { throw bodyError }
+            throw error
+        }
+        guard let outcome else {
+            throw NSError(domain: RLMRealmSessionAdmissionErrorDomain,
+                code: RLMRealmSessionAdmissionError.unreadable.rawValue)
+        }
+        return try outcome.get()
     }
 }

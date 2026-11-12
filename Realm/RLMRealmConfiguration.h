@@ -45,6 +45,45 @@ typedef BOOL (^RLMShouldCompactOnLaunchBlock)(NSUInteger totalBytes, NSUInteger 
  cache and reuse a single configuration object for each distinct configuration rather than
  creating a new object each time you open a Realm.
  */
+FOUNDATION_EXPORT NSErrorDomain const RLMRealmSessionAdmissionErrorDomain;
+
+typedef NS_ERROR_ENUM(RLMRealmSessionAdmissionErrorDomain, RLMRealmSessionAdmissionError) {
+    RLMRealmSessionAdmissionErrorIncompatibleSession = 1,
+    RLMRealmSessionAdmissionErrorInvalidDescriptor,
+    RLMRealmSessionAdmissionErrorUnsupportedConfiguration,
+    RLMRealmSessionAdmissionErrorUnreadable,
+    RLMRealmSessionAdmissionErrorUnknownSchema,
+    RLMRealmSessionAdmissionErrorNonemptyTable,
+    RLMRealmSessionAdmissionErrorBusy,
+};
+
+// Read-only facts observed under exclusive lifecycle access. These are not an
+// admission token and grant no authority to a subsequent mutable open.
+NS_SWIFT_SENDABLE
+@interface RLMRealmFileInspection : NSObject
+@property (nonatomic, readonly) NSURL *fileURL;
+@property (nonatomic, readonly) BOOL fileExists;
+@property (nonatomic, readonly, nullable) NSNumber *schemaVersion;
+@end
+
+NS_SWIFT_SENDABLE
+@interface RLMRealmSessionAdmission : NSObject<NSCopying>
+- (nullable instancetype)initWithIdentifier:(NSString *)identifier
+                             objectClasses:(NSArray<Class> *)objectClasses
+                                     error:(NSError **)error NS_SWIFT_NAME(init(identifier:objectClasses:));
+- (instancetype)init NS_UNAVAILABLE;
+@property (nonatomic, readonly) NSString *identifier;
+@property (nonatomic, readonly) NSData *fingerprint;
+// The callback must not open a Realm at any locked path, remove/move its
+// coordination files, or retain a live Realm handle. Locks span the callback.
+// Only payloads may be consumed/replaced; the actual adjacent lock inode must
+// survive. Historical lifecycle implementations that remove it are unsupported.
++ (BOOL)performExclusiveFileAccessWithConfigurations:(NSArray<RLMRealmConfiguration *> *)configurations
+                                               body:(NS_NOESCAPE BOOL (^)(NSArray<RLMRealmFileInspection *> *, NSError **))body
+                                              error:(NSError **)error
+    NS_SWIFT_NAME(performExclusiveFileAccess(configurations:body:));
+@end
+
 @interface RLMRealmConfiguration : NSObject<NSCopying>
 
 #pragma mark - Default Configuration
@@ -65,6 +104,15 @@ typedef BOOL (^RLMShouldCompactOnLaunchBlock)(NSUInteger totalBytes, NSUInteger 
 + (void)setDefaultConfiguration:(RLMRealmConfiguration *)configuration;
 
 #pragma mark - Properties
+
+/** Immutable writer-cohort contract; nil selects an ordinary mutable cohort.
+ Both mutable cohorts require an absent payload or a regular file with one
+ directory entry, plus a stable adjacent coordination file. Terminal payload
+ aliases are unsupported; a parent-directory alias must share both actual files.
+ Unmodified historical alias writers and lifecycle code that unlinks or replaces
+ coordination files are outside this advisory contract.
+ */
+@property (nonatomic, copy, nullable) RLMRealmSessionAdmission *sessionAdmission;
 
 /// The local URL of the Realm file. Mutually exclusive with `inMemoryIdentifier`;
 /// setting one of the two properties will automatically nil out the other.

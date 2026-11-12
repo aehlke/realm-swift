@@ -150,6 +150,9 @@ REALM_NOINLINE void RLMRealmTranslateException(NSError **error) {
     try {
         throw;
     }
+    catch (SessionAdmissionError const& ex) {
+        RLMSetErrorOrThrow(RLMRealmSessionAdmissionErrorFromException(ex), error);
+    }
     catch (FileAccessError const& ex) {
         RLMSetErrorOrThrow(makeError(ex), error);
     }
@@ -177,6 +180,9 @@ RLMRealm *getCachedRealm(RLMRealmConfiguration *configuration, RLMScheduler *opt
     }
 
     auto const& oldConfig = realm->_realm->config();
+    if (SessionAdmission::identity_of(oldConfig.session_admission) != SessionAdmission::identity_of(config.session_admission)) {
+        throw SessionAdmissionError(SessionAdmissionError::Reason::incompatible_session);
+    }
     if ((oldConfig.read_only() || oldConfig.immutable()) != configuration.readOnly) {
         @throw RLMException(@"Realm at path '%@' already opened with different read permissions", configuration.fileURL.path);
     }
@@ -365,12 +371,19 @@ bool copySeedFile(RLMRealmConfiguration *configuration, NSError **error) {
 + (instancetype)realmWithConfiguration:(RLMRealmConfiguration *)configuration
                             confinedTo:(RLMScheduler *)scheduler
                                  error:(NSError **)error {
-    // First check if we already have a cached Realm for this config
-    if (auto realm = getCachedRealm(configuration, scheduler)) {
-        return realm;
-    }
-
-    if (copySeedFile(configuration, error)) {
+    // Contract/configuration rejection must be recoverable even on the early
+    // binding-cache path, before seed copying or any ordinary Core open.
+    try {
+        if (configuration.sessionAdmission && (configuration.readOnly || configuration.inMemoryIdentifier
+            || configuration.seedFilePath || configuration.deleteRealmIfMigrationNeeded))
+            throw SessionAdmissionError(SessionAdmissionError::Reason::unsupported_configuration);
+        auto const& requested = configuration.configRef;
+        if (!requested.immutable() && !requested.in_memory && requested.realm_data.is_null())
+            SessionAdmission::validate_payload_path(requested.path);
+        if (auto realm = getCachedRealm(configuration, scheduler)) return realm;
+        if (copySeedFile(configuration, error)) return nil;
+    } catch (...) {
+        RLMRealmTranslateException(error);
         return nil;
     }
 
